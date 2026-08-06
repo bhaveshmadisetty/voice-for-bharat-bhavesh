@@ -2,3 +2,7 @@
 .env.*
 !.env.example
 .DS_Store
+
+# Local LiveKit server binary (54MB, download separately)
+livekit-server.exe
+livekit-server
