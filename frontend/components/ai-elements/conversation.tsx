@@ -11,7 +11,10 @@ export type ConversationProps = ComponentProps<typeof StickToBottom>;
 
 export const Conversation = ({ className, ...props }: ConversationProps) => (
   <StickToBottom
-    className={cn('relative flex-1 overflow-y-hidden', className)}
+    // overflow-y-auto (not hidden) so the transcript can actually be scrolled
+    // back through, and overscroll-contain so scrolling past the top does not
+    // start scrolling the page behind it.
+    className={cn('relative flex-1 overflow-y-auto overscroll-contain', className)}
     initial="smooth"
     resize="smooth"
     role="log"

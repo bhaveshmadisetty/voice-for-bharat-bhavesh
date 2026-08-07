@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from dotenv import load_dotenv
@@ -8,10 +9,12 @@ from livekit.agents import (
     AgentSession,
     JobContext,
     JobProcess,
+    UserStateChangedEvent,
     cli,
     inference,
     tokenize,
     room_io,
+    UserInputTranscribedEvent,
 )
 from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
@@ -22,12 +25,25 @@ load_dotenv(".env.local")
 
 # The agent's instructions live in prompts.py so they can be iterated
 # without touching the pipeline code below.
-from prompts import SYSTEM_PROMPT
+from prompts import (
+    GREETING_INSTRUCTIONS,
+    SILENCE_CLOSING_INSTRUCTIONS,
+    SILENCE_REPROMPT_INSTRUCTIONS,
+    SYSTEM_PROMPT,
+)
 
 
 class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(instructions=SYSTEM_PROMPT)
+
+    async def on_enter(self) -> None:
+        """Speak first, so the customer knows who picked up and what we do.
+
+        Generated rather than a fixed string, so the wording varies between
+        calls and the agent is free to open in whichever language fits.
+        """
+        self.session.generate_reply(instructions=GREETING_INSTRUCTIONS)
 
     # To add tools, use the @function_tool decorator.
     # Here's an example that adds a simple weather tool.
@@ -47,7 +63,9 @@ class Assistant(Agent):
     #     return "sunny with a temperature of 70 degrees."
 
 
-server = AgentServer()
+# Loading Silero VAD plus the multilingual turn detector takes ~10-15s on a cold
+# start, which overruns the 10s default and kills the worker before it registers.
+server = AgentServer(initialize_process_timeout=60.0)
 
 
 def prewarm(proc: JobProcess):
@@ -69,7 +87,11 @@ async def my_agent(ctx: JobContext):
     session = AgentSession(
         # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
         # See all available models at https://docs.livekit.io/agents/models/stt/
-        stt=deepgram.STT(model="nova-3"),
+        # "multi" turns on code-switching, so a customer can say
+        # "do kilo sugar aur ek Amul butter" in one breath and have both the
+        # Hindi and the English land in the same transcript. The default
+        # (en-US) mangles anything not in English.
+        stt=deepgram.STT(model="nova-3", language="multi"),
         # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
         # See all available models at https://docs.livekit.io/agents/models/llm/
         llm=google.LLM(
@@ -78,7 +100,13 @@ async def my_agent(ctx: JobContext):
         # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
         # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
         tts=murf.TTS(
-                voice="Anisha", 
+                voice="Anisha",
+                # The locale is fixed for the whole session and no Indian voice
+                # supports both en-IN and hi-IN, so it cannot follow the
+                # customer's language switch. en-IN is the better compromise:
+                # it reads English cleanly and still handles romanised Hindi
+                # ("do kilo", "theek hai") acceptably. hi-IN does the reverse,
+                # giving plain English a heavy Hindi accent.
                 locale="en-IN",
                 style="Conversation",
                 tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
@@ -91,7 +119,42 @@ async def my_agent(ctx: JobContext):
         # allow the LLM to generate a response while waiting for the end of turn
         # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
         preemptive_generation=True,
+        # How long the customer can stay quiet before we treat them as away.
+        # Kirana calls have real pauses — someone checks the kitchen shelf
+        # mid-order — so this is longer than the 15s default.
+        user_away_timeout=20.0,
     )
+
+    # Handle the customer going quiet: nudge once, then close out politely
+    # rather than holding a dead line open.
+    silence_strikes = 0
+
+    @session.on("user_state_changed")
+    def on_user_state_changed(ev: UserStateChangedEvent) -> None:
+        nonlocal silence_strikes
+
+        if ev.new_state != "away":
+            # They came back — any earlier silence no longer counts against them.
+            if ev.new_state == "speaking":
+                silence_strikes = 0
+            return
+
+        silence_strikes += 1
+        logger.info("user went quiet (strike %d)", silence_strikes)
+
+        if silence_strikes == 1:
+            session.generate_reply(instructions=SILENCE_REPROMPT_INSTRUCTIONS)
+        else:
+            # Second failure: say goodbye, then end the session once the
+            # closing line has actually finished playing.
+            async def close_after_goodbye() -> None:
+                handle = session.generate_reply(
+                    instructions=SILENCE_CLOSING_INSTRUCTIONS
+                )
+                await handle.wait_for_playout()
+                await session.aclose()
+
+            asyncio.create_task(close_after_goodbye())
 
     # To use a realtime model instead of a voice pipeline, use the following session setup instead.
     # (Note: This is for the OpenAI Realtime API. For other providers, see https://docs.livekit.io/agents/models/realtime/))

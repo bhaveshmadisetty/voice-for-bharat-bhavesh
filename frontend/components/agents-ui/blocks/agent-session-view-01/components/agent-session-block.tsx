@@ -217,7 +217,9 @@ export function AgentSessionView_01({
               <AgentChatTranscript
                 agentState={agentState}
                 messages={messages}
-                className="mx-auto w-full max-w-2xl [&_.is-user>div]:rounded-[22px] [&>div>div]:px-4 [&>div>div]:pt-40 md:[&>div>div]:px-6"
+                // pt-20 rather than pt-40: enough to clear the top fade, without
+                // the huge dead gap that made the pane feel unresponsive.
+                className="mx-auto w-full max-w-2xl [&_.is-user>div]:rounded-[22px] [&>div>div]:px-4 [&>div>div]:pt-20 md:[&>div>div]:px-6"
               />
             </motion.div>
           )}
